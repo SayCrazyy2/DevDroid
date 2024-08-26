@@ -57,3 +57,7 @@ Using this script on a phone with ROOT access is even easier, just open Termux a
 Chrome often closes itself in the background to save memory. If a connection failure occurs, switch to Chrome, confirm that Chrome and the tab you need to debug are still running, and then try again.
 
 If the problem still persists, please [raise an issue](https://github.com/lyc8503/AndroidChromeDevTools/issues) in this repo and attach the FULL log.
+
+### Alternative
+
+[ChromeXt](https://github.com/JingMatrix/ChromeXt) might be a good choice too!
