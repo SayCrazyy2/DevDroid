@@ -1,0 +1,3 @@
+# DevDroid — pinned for Termux (fork of AndroidChromeDevTools)
+aiohttp>=3.9,<4
+websockets>=12,<15
