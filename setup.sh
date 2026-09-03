@@ -5,7 +5,7 @@
 # Usage: bash setup.sh [--update] [--uninstall] [--help]
 set -euo pipefail
 
-VERSION="2.2.3"
+VERSION="2.2.4"
 REPO="SayCrazyy2/DevDroid"
 RAW="https://raw.githubusercontent.com/$REPO/main"
 

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import sys
 
-VERSION = "2.2.3"
+VERSION = "2.2.4"
 # Ultra-fast path for --version / --help (avoid heavy imports on Termux where even asyncio is ~2s)
 if "--version" in sys.argv or "-V" in sys.argv:
     # only fast if version is the main arg; otherwise let argparse handle
@@ -420,8 +420,30 @@ def start_shizuku_direct_forward(cdp_port: int = CDP_PORT, verbose: bool = False
                         return True
             # If not LISTEN, try next abstract
 
-    # Fallback: pure-python forwarder via rish
-    info("  socat not available or no abstract worked — trying Python forwarder via rish…")
+    # Fallback: pure-python forwarder — try Termux direct first (Termux may have adb group on some ROMs)
+    # Test if Termux can directly connect to abstract (no rish needed) — if yes, we don't need rish's shell
+    rc, out = run("python3 -c \"import socket; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(1); s.connect(chr(0)+'chrome_devtools_remote'); print('TERMUX_CAN_CONNECT')\" 2>&1 | head -5", shell=True, timeout=5)
+    termux_can_direct = "TERMUX_CAN_CONNECT" in out
+    info(f"  Termux direct abstract test: {out[:120]!r} -> can_direct={termux_can_direct}")
+    if termux_can_direct:
+        info("  Trying Python forwarder via Termux directly (no rish needed)…")
+        # Write script already done, now launch via Termux
+        _termux_py = which("python3") or "/data/data/com.termux/files/usr/bin/python3"
+        rc, out = run(f"nohup {_termux_py} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!", shell=True, timeout=5)
+        info(f"  Termux direct launch -> rc={rc} pid={out[:80]!r}")
+        time.sleep(1.5)
+        rc, out = run(f"ss -tln 2>/dev/null | grep -q ':{cdp_port} ' && echo LISTEN || netstat -tln 2>/dev/null | grep -q ':{cdp_port} ' && echo LISTEN || cat {DIRECT_FORWARD_LOG} 2>/dev/null | head -20", shell=True, timeout=4)
+        if "LISTEN" in out or "listening 127.0.0.1" in out:
+            time.sleep(0.8)
+            rc, out3 = run(f"curl -s --connect-timeout 3 http://127.0.0.1:{cdp_port}/json/version 2>&1 | head -5", shell=True, timeout=5)
+            if "Browser" in out3:
+                ok(f"Termux direct forward tcp:{cdp_port} -> abstract works (no rish)")
+                return True
+            else:
+                warn(f"Termux direct LISTEN but CDP not yet (Chrome? {out3[:120]}) — keeping")
+                return True
+
+    info("  Termux direct failed or no permission — trying Python forwarder via rish (shell)…")
     python_forward_code = f'''
 import socket, threading, os, sys
 CDP_PORT={cdp_port}
@@ -498,41 +520,65 @@ if __name__=="__main__":
     privileged_exec(f"pkill -f devdroid_forward.py 2>/dev/null; true; rm -f {DIRECT_FORWARD_LOG}", "shizuku")
     run(f"pkill -f devdroid_forward.py 2>/dev/null; true", shell=True, timeout=3)
     time.sleep(0.5)
-    # Launch via rish — use Termux python full path (rish's PATH lacks $PREFIX)
+    # Launch via rish — Termux's $PREFIX is not accessible to shell (rish) due to scoped storage
+    # So copy python binary to world-readable /data/local/tmp first
     termux_python = which("python3") or "/data/data/com.termux/files/usr/bin/python3"
-    # Also check alternative names
     if not Path(termux_python).exists():
         for cand in ["/data/data/com.termux/files/usr/bin/python", "/data/data/com.termux/files/usr/bin/python3.12", "/data/data/com.termux/files/usr/bin/python3.11"]:
             if Path(cand).exists():
                 termux_python = cand
                 break
-    # Try rish with full path, plus fallback to Termux directly
-    # Also try nohup via toybox or Termux nohup
+    # Copy to /data/local/tmp for rish access (Termux private dir is 700, shell can't read)
+    rish_python = "/data/local/tmp/devdroid_python3"
+    rc, out = run(f"cp {termux_python} {rish_python} 2>&1 && chmod 755 {rish_python} 2>&1 && ls -l {rish_python} 2>&1 | head -1", shell=True, timeout=8)
+    if rc == 0 and "rwxr" in out:
+        info(f"  copied python to {rish_python} for rish")
+        termux_python_for_rish = rish_python
+    else:
+        warn(f"  copy python to /data/local/tmp failed: {out[:200]} — trying direct Termux path and system python")
+        termux_python_for_rish = termux_python
+        # Also try system python if exists
+        rc2, out2 = privileged_exec("which python3; which python; ls /system/bin/python* 2>/dev/null; ls /apex/com.android.art/bin/python* 2>/dev/null | head -5", "shizuku")
+        if out2 and "python" in out2:
+            info(f"  system python candidates: {out2[:200]}")
+            # Prefer system python if Termux one not accessible
+            for cand in out2.split():
+                if "python" in cand and cand.startswith("/"):
+                    termux_python_for_rish = cand.strip()
+                    break
+
+    # Use /system/bin/nohup (Termux's nohup is not accessible to shell)
     nohup_bin = "/system/bin/nohup"
-    if Path("/data/data/com.termux/files/usr/bin/nohup").exists():
-        nohup_bin = "/data/data/com.termux/files/usr/bin/nohup"
+    # Verify nohup exists via rish
+    rc, out = privileged_exec("which nohup; ls /system/bin/nohup 2>/dev/null; ls /apex/*/bin/nohup 2>/dev/null | head -1", "shizuku")
+    if "nohup" not in out:
+        nohup_bin = "nohup"  # fallback to PATH
     launch_cmds = [
-        f"{nohup_bin} {termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!",
-        f"nohup {termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!",
-        f"{termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!",
+        f"{nohup_bin} {termux_python_for_rish} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!",
+        f"nohup {termux_python_for_rish} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!",
+        f"{termux_python_for_rish} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!",
+        f"sh -c 'nohup {termux_python_for_rish} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 &' ; echo $!",
     ]
     rc, out = 1, ""
     for lc in launch_cmds:
         rc, out = privileged_exec(lc, "shizuku")
+        # Filter out "inaccessible" false-success: rish returns rc=0 even if nohup fails, but out will contain "inaccessible"
+        if "inaccessible" in out or "No such file" in out:
+            info(f"  rish launch failed (inaccessible) for {lc[:60]}… -> {out[:120]!r}")
+            rc = 1
+            continue
         info(f"  python forward via rish ({lc[:60]}…) -> rc={rc} pid={out[:80]!r}")
         if rc == 0 and out.strip().isdigit():
             break
-        # Also try without nohup but with sh -c
-        if "No such file" in out and "python" in out:
-            continue
-    # Also try via Termux python if rish python not available
-    if rc != 0 or not out.strip().isdigit():
-        rc, out = run(f"nohup {termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!", shell=True, timeout=5)
-        info(f"  python forward via Termux ({termux_python}) -> rc={rc} pid={out[:80]!r}")
-        if rc != 0 or not out.strip().isdigit():
-            # Last resort: try python without nohup
-            rc, out = run(f"{termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!", shell=True, timeout=5)
-            info(f"  python forward via Termux (no nohup) -> rc={rc} pid={out[:80]!r}")
+    # Fallback: try via Termux directly (if shell forward fails, Termux user may still be able to connect to abstract? Try it)
+    if rc != 0 or not out.strip().isdigit() or "inaccessible" in out:
+        info(f"  rish python failed, trying Termux direct (no rish) — may fail if Termux lacks shell group, but worth trying")
+        # Termux directly can try to run forward without rish — it may have permission on some devices
+        for lc in [f"nohup {termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!", f"{termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!"]:
+            rc, out = run(lc, shell=True, timeout=5)
+            info(f"  python forward via Termux ({lc[:50]}…) -> rc={rc} pid={out[:80]!r}")
+            if rc == 0 and out.strip().isdigit():
+                break
     time.sleep(1.5)
     # Verify listening
     rc, out = run(f"ss -tln 2>/dev/null | grep -q ':{cdp_port} ' && echo LISTEN || netstat -tln 2>/dev/null | grep -q ':{cdp_port} ' && echo LISTEN || cat {DIRECT_FORWARD_LOG} 2>/dev/null | head -20", shell=True, timeout=4)
