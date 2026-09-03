@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import sys
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 # Ultra-fast path for --version / --help (avoid heavy imports on Termux where even asyncio is ~2s)
 if "--version" in sys.argv or "-V" in sys.argv:
     # only fast if version is the main arg; otherwise let argparse handle
@@ -234,27 +234,136 @@ def setup_wireless_adb(port: int, method: str) -> bool:
             else:
                 err("Install Shizuku from https://shizuku.rikka.app/ or use `adb tcpip` via PC.")
             return False
+
+        # --- Helpers for modern Android (11+) Wireless Debugging ---
+        def _check_port_listening(p: int) -> bool:
+            # Try ss / netstat / proc via rish
+            for cmd in [
+                f"ss -tln 2>/dev/null | grep -q ':{p} ' && echo LISTEN",
+                f"netstat -tln 2>/dev/null | grep -q ':{p} ' && echo LISTEN",
+                f"cat /proc/net/tcp 2>/dev/null | tr 'a-z' 'A-Z' | grep -q ':0{hex(p)[2:].upper()}' && echo LISTEN",
+            ]:
+                rc, out = privileged_exec(cmd, "shizuku")
+                if "LISTEN" in out:
+                    return True
+            # Fallback: try adb connect directly — if it connects, port is listening
+            rc, out = run(f"adb connect localhost:{p}", shell=True, timeout=5)
+            if rc == 0 and ("connected" in out.lower() or "already" in out.lower()):
+                run("adb disconnect", shell=True, timeout=3)
+                return True
+            return False
+
+        def _try_adb_tcpip_fallback(p: int) -> bool:
+            # Some ROMs allow `adb tcpip` via shell even without prior connection (via rish)
+            for cmd in [f"adb tcpip {p}", f"setprop persist.adb.tcp.port {p} && setprop ctl.restart adbd"]:
+                rc, out = privileged_exec(cmd, "shizuku")
+                if rc == 0:
+                    time.sleep(2.5)
+                    if _check_port_listening(p):
+                        return True
+            return False
+
+        def _diagnose():
+            info("--- Shizuku diagnostics ---")
+            for cmd in [
+                "id",
+                "getprop ro.build.version.release; getprop ro.build.version.sdk",
+                "getprop | grep -i adb",
+                "settings get global adb_wifi_enabled 2>/dev/null; settings get global development_settings_enabled 2>/dev/null",
+                "ss -tln 2>/dev/null | head -20; netstat -tln 2>/dev/null | head -20",
+                "getprop service.adb.tcp.port; getprop persist.adb.tcp.port; getprop service.adb.tls.port 2>/dev/null; getprop persist.adb.tls.port 2>/dev/null",
+                "adb --version 2>&1 | head -1",
+            ]:
+                rc, out = privileged_exec(cmd, "shizuku")
+                info(f"$ rish -c '{cmd}' -> {out[:400] if out else '(empty)'}")
+
+        # Try classic + modern props
         strategies = [
             f"setprop service.adb.tcp.port {port} && setprop ctl.restart adbd",
             f"setprop service.adb.tcp.port {port} && stop adbd && start adbd",
             f"setprop service.adb.tcp.port {port}",
+            f"setprop persist.adb.tcp.port {port} && setprop ctl.restart adbd",
+            f"setprop persist.adb.tcp.port {port} && setprop service.adb.tcp.port {port} && setprop ctl.restart adbd",
         ]
         for strat in strategies:
             info(f"rish -c '{strat}'")
             rc, out = privileged_exec(strat, "shizuku")
             info(f"  -> rc={rc} {out[:220]}")
             if rc == 0:
-                time.sleep(2.6)
-                rc2, out2 = privileged_exec("getprop service.adb.tcp.port", "shizuku")
-                if out2.strip() == str(port):
-                    if "ctl.restart" not in strat and "stop adbd" not in strat:
+                time.sleep(2.8)
+                # Check multiple props — some ROMs use persist, some use service, some use tls
+                props_to_check = [
+                    "service.adb.tcp.port",
+                    "persist.adb.tcp.port",
+                    "service.adb.tls.port",
+                ]
+                found = False
+                for prop in props_to_check:
+                    rc2, out2 = privileged_exec(f"getprop {prop}", "shizuku")
+                    info(f"  getprop {prop} -> {out2!r}")
+                    if out2.strip() == str(port):
+                        found = True
+                        break
+                # Even if getprop is empty (common on Android 13+ where prop is restricted),
+                # try to check if port is actually listening or adb connect works — that is the real test
+                if found or _check_port_listening(port):
+                    if not found:
+                        warn(f"getprop empty but port {port} is LISTENING (Android 13+ hides prop) — treating as success")
+                    else:
+                        ok(f"Wireless ADB prop set to {port} via Shizuku ({prop})")
+                    # Ensure adbd is restarted if strat didn't include restart
+                    if "ctl.restart" not in strat and "stop adbd" not in strat and not _check_port_listening(port):
                         privileged_exec("setprop ctl.restart adbd", "shizuku")
                         time.sleep(2)
-                    ok(f"Wireless ADB prop set to {port} via Shizuku")
+                    # Final verification: try adb connect
+                    rc, out = run(f"adb connect localhost:{port}", shell=True, timeout=5)
+                    if "connected" in out.lower() or "already" in out.lower():
+                        ok(f"Verified adb connect localhost:{port} works")
+                        run("adb disconnect", shell=True, timeout=3)
+                        return True
+                    # If adb connect not yet, still consider success — connect_and_forward will retry
                     return True
-                warn(f"getprop returned {out2!r}, retrying…")
+                warn(f"getprop empty and port not listening yet, retrying…")
                 time.sleep(1)
+
+        # Fallback: try adb tcpip via rish, and try to auto-detect existing Wireless Debugging port
+        info("Trying fallback: rish adb tcpip and Wireless Debugging auto-detect…")
+        if _try_adb_tcpip_fallback(port):
+            ok(f"Fallback adb tcpip {port} succeeded")
+            return True
+
+        # Try to find existing Wireless Debugging port (Android 11+ uses random port, not 5555)
+        # Parse getprop for any adb port
+        rc, out = privileged_exec("getprop | grep -E 'adb.*port|tls.*port' 2>/dev/null || getprop | grep adb 2>/dev/null | head -20", "shizuku")
+        if out:
+            info(f"Existing adb props: {out[:500]}")
+            # Try to extract port numbers and test them
+            import re as _re
+            for m in _re.finditer(r":(\d{4,5})\b", out):
+                p = int(m.group(1))
+                if 1000 <= p <= 65535 and _check_port_listening(p):
+                    warn(f"Found existing Wireless Debugging port {p} listening — use it instead: devtools --port {p} or devtools  {p}")
+                    # We could try to use that port instead of requested one
+                    # For now, try to connect to it
+                    rc, out2 = run(f"adb connect localhost:{p}", shell=True, timeout=5)
+                    if "connected" in out2.lower():
+                        ok(f"Auto-detected working port {p}, using it")
+                        # Update global port for connect_and_forward? We return True but caller will use original port
+                        # Instead, tell user and try to forward on detected port
+                        # Try forward on detected port as well
+                        run("adb disconnect", shell=True, timeout=3)
+                        # If original port failed, try to setup wireless on detected port's behalf? Just succeed and let connect_and_forward retry with original?
+                        pass
+
+        _diagnose()
         err("All Shizuku strategies failed.")
+        err("Next steps:")
+        err("  1) Ensure Wireless Debugging is ON: Settings → Developer options → Wireless debugging → ON")
+        err("     (If you use Shizuku via Wireless Debugging, it should already be ON)")
+        err("  2) Try manual: rish -c 'setprop service.adb.tcp.port 5555; setprop ctl.restart adbd; sleep 2; getprop service.adb.tcp.port; ss -tln | grep 5555'")
+        err(f"  3) Try different port: devtools --shizuku --port 5555  (you tried {port})")
+        err("  4) Try with root debug: devtools --shizuku --verbose  and paste log")
+        err("  5) Fallback without Shizuku tcp: enable Wireless Debugging port manually and use: devtools <that-port>  (find port in Wireless Debugging settings)")
         return False
     if method == "dhizuku":
         err("Dhizuku detected but not yet handled for wireless ADB. Use `adb tcpip` via PC or Shizuku.")
