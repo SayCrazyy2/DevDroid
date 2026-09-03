@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import sys
 
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 # Ultra-fast path for --version / --help (avoid heavy imports on Termux where even asyncio is ~2s)
 if "--version" in sys.argv or "-V" in sys.argv:
     # only fast if version is the main arg; otherwise let argparse handle
@@ -369,6 +369,163 @@ def setup_wireless_adb(port: int, method: str) -> bool:
         err("Dhizuku detected but not yet handled for wireless ADB. Use `adb tcpip` via PC or Shizuku.")
         return False
     err(f"Unknown method {method}")
+    return False
+
+DIRECT_FORWARD_SCRIPT = "/data/local/tmp/devdroid_forward.py"
+DIRECT_FORWARD_LOG = "/data/local/tmp/devdroid_forward.log"
+
+def start_shizuku_direct_forward(cdp_port: int = CDP_PORT, verbose: bool = False) -> bool:
+    """
+    Fallback for Android 11+ where setprop is blocked and adb tcpip fails.
+    Uses rish (shell) to directly forward TCP 127.0.0.1:cdp_port -> abstract:chrome_devtools_remote
+    via socat or a pure-python forwarder. No adb connect needed.
+    """
+    info("Trying Shizuku direct-forward (no adb connect needed)…")
+    # Check what forwarders are available via rish
+    rc, out = privileged_exec("which socat; which nc; which ncat; which busybox; which toybox", "shizuku")
+    has_socat = "socat" in out
+    has_nc = "nc" in out or "ncat" in out
+    info(f"  tools via rish: {out[:200] or '(none)'}  socat={has_socat}")
+
+    # Try socat for each abstract
+    for abstract in ABSTRACTS:
+        if has_socat:
+            # Kill any old socat on this port
+            privileged_exec(f"pkill -f 'socat.*:{cdp_port}' 2>/dev/null; true", "shizuku")
+            time.sleep(0.5)
+            # socat TCP-LISTEN:9222 -> ABSTRACT
+            # Use nohup so it survives after rish exits
+            cmd = f"nohup socat TCP-LISTEN:{cdp_port},fork,reuseaddr,bind=127.0.0.1 ABSTRACT-CONNECT:{abstract} >/dev/null 2>&1 & echo $!"
+            rc, out = privileged_exec(cmd, "shizuku")
+            info(f"  socat {abstract} -> rc={rc} pid={out[:50]}")
+            time.sleep(1.2)
+            # Verify listening
+            rc, out2 = run(f"ss -tln 2>/dev/null | grep -q ':{cdp_port} ' && echo LISTEN || netstat -tln 2>/dev/null | grep -q ':{cdp_port} ' && echo LISTEN || echo NO", shell=True, timeout=4)
+            # Also try via rish ss
+            rc2, out3 = privileged_exec(f"ss -tln 2>/dev/null | grep ':{cdp_port} ' || netstat -tln 2>/dev/null | grep ':{cdp_port} ' || echo NO", "shizuku")
+            if "LISTEN" in (out2 + out3) or "9222" in (out2 + out3):
+                # Try to curl CDP via the forward
+                time.sleep(0.8)
+                rc, out4 = run(f"curl -s --connect-timeout 3 http://127.0.0.1:{cdp_port}/json/version 2>&1 | head -5", shell=True, timeout=5)
+                if "Browser" in out4 or "Chrome" in out4 or "devtools" in out4.lower():
+                    ok(f"Direct socat forward tcp:{cdp_port} -> {abstract} works (no adb needed)")
+                    return True
+                else:
+                    info(f"  socat listening but CDP not yet (Chrome running? curl: {out4[:120]}) — keeping forward, will try next abstract")
+                    # Don't kill, keep it; but try next abstract if this one not Chrome
+                    # Actually keep first that LISTENs, even if Chrome not yet — Chrome may start later
+                    # We consider LISTEN as success
+                    if "LISTEN" in (out2 + out3):
+                        ok(f"Direct socat forward tcp:{cdp_port} -> {abstract} LISTEN (Chrome may be not foreground)")
+                        return True
+            # If not LISTEN, try next abstract
+
+    # Fallback: pure-python forwarder via rish
+    info("  socat not available or no abstract worked — trying Python forwarder via rish…")
+    python_forward_code = f'''
+import socket, threading, os, sys
+CDP_PORT={cdp_port}
+ABSTRACTS={ABSTRACTS!r}
+def forward(client, abstract):
+    try:
+        # Connect to Chrome abstract
+        s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s2.connect("\\0" + abstract)
+        def pipe(a,b):
+            try:
+                while True:
+                    d=a.recv(8192)
+                    if not d: break
+                    b.sendall(d)
+            except: pass
+            finally:
+                try: a.close()
+                except: pass
+                try: b.close()
+                except: pass
+        threading.Thread(target=pipe, args=(client, s2), daemon=True).start()
+        pipe(s2, client)
+    except Exception as e:
+        try: client.close()
+        except: pass
+
+def main():
+    # Try each abstract, use first that exists (check via socket connect test)
+    chosen=None
+    for ab in ABSTRACTS:
+        try:
+            s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect("\\0"+ab)
+            s.close()
+            chosen=ab
+            break
+        except: pass
+    if not chosen:
+        # Fallback to first
+        chosen=ABSTRACTS[0]
+    print(f"[forward] chosen abstract={{chosen}}", flush=True)
+    srv=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("127.0.0.1", CDP_PORT))
+    except Exception as e:
+        print(f"bind failed {{e}}", flush=True)
+        sys.exit(1)
+    srv.listen(32)
+    print(f"[forward] listening 127.0.0.1:{{CDP_PORT}} -> {{chosen}} (pid={{os.getpid()}})", flush=True)
+    while True:
+        try:
+            c,a=srv.accept()
+            threading.Thread(target=forward, args=(c, chosen), daemon=True).start()
+        except Exception as e:
+            print(f"accept error {{e}}", flush=True)
+            break
+
+if __name__=="__main__":
+    main()
+'''
+    # Write script via rish (use cat heredoc)
+    # First, try to write via Termux directly to /data/local/tmp if writable, else via rish
+    rc, out = run(f"cat > {DIRECT_FORWARD_SCRIPT} << 'PYEOF'\n{python_forward_code}\nPYEOF\ncat {DIRECT_FORWARD_SCRIPT} | head -5", shell=True, timeout=8)
+    if rc != 0 or "import socket" not in out:
+        # Try via rish echo
+        # Escape single quotes for rish -c
+        b64_cmd = f"cat > {DIRECT_FORWARD_SCRIPT} << 'PYEOF'\n{python_forward_code}\nPYEOF"
+        rc, out = privileged_exec(b64_cmd, "shizuku")
+        info(f"  write via rish -> rc={rc}")
+    # Kill old forward
+    privileged_exec(f"pkill -f devdroid_forward.py 2>/dev/null; true; rm -f {DIRECT_FORWARD_LOG}", "shizuku")
+    run(f"pkill -f devdroid_forward.py 2>/dev/null; true", shell=True, timeout=3)
+    time.sleep(0.5)
+    # Launch via rish nohup
+    launch = f"nohup python3 {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!"
+    rc, out = privileged_exec(launch, "shizuku")
+    info(f"  python forward launch -> rc={rc} pid={out[:80]}")
+    # Also try via Termux python if rish python not available
+    if rc != 0 or not out.strip().isdigit():
+        rc, out = run(f"nohup python3 {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!", shell=True, timeout=5)
+        info(f"  python forward via Termux -> rc={rc} pid={out[:80]}")
+    time.sleep(1.5)
+    # Verify listening
+    rc, out = run(f"ss -tln 2>/dev/null | grep -q ':{cdp_port} ' && echo LISTEN || netstat -tln 2>/dev/null | grep -q ':{cdp_port} ' && echo LISTEN || cat {DIRECT_FORWARD_LOG} 2>/dev/null | head -20", shell=True, timeout=4)
+    rc2, out2 = privileged_exec(f"ss -tln 2>/dev/null | grep ':{cdp_port} ' || cat {DIRECT_FORWARD_LOG} 2>/dev/null | head -20", "shizuku")
+    combined = out + out2
+    info(f"  verify listening: {combined[:400]}")
+    if "LISTEN" in combined or "listening 127.0.0.1" in combined:
+        # Try curl
+        time.sleep(0.8)
+        rc, out3 = run(f"curl -s --connect-timeout 3 http://127.0.0.1:{cdp_port}/json/version 2>&1 | head -5", shell=True, timeout=5)
+        if "Browser" in out3:
+            ok(f"Python direct forward tcp:{cdp_port} -> abstract works")
+        else:
+            warn(f"Forward LISTEN but CDP not responding yet (Chrome foreground? curl: {out3[:150]}) — keeping forward")
+        return True
+    err(f"Direct forward failed to LISTEN on :{cdp_port}. Log: {combined[:300]}")
+    # Print log
+    rc, log = privileged_exec(f"cat {DIRECT_FORWARD_LOG} 2>/dev/null | head -30", "shizuku")
+    if log:
+        info(f"  forward log: {log[:500]}")
     return False
 
 def find_existing_abstract() -> Optional[str]:
@@ -937,20 +1094,53 @@ async def main_async(args):
             sys.exit(1)
         port=random.randint(10000,60000)
         log(f"Using random wireless ADB port {port} via {method}",C_YELLOW)
-        if not setup_wireless_adb(port,method):
-            err("Wireless ADB setup failed."); sys.exit(1)
+        wireless_ok = setup_wireless_adb(port,method)
+        if not wireless_ok:
+            if method in ("shizuku","sui","shizuku-pending"):
+                warn("Wireless ADB failed — trying Shizuku direct-forward (bypasses adb tcp, uses rish socat/python)…")
+                if start_shizuku_direct_forward(cdp_port=CDP_PORT, verbose=args.verbose):
+                    ok("Direct forward active — will use it instead of adb forward")
+                    # Mark port as None to skip adb connect/forward
+                    port = None
+                else:
+                    err("Wireless ADB setup failed and direct forward also failed."); sys.exit(1)
+            else:
+                err("Wireless ADB setup failed."); sys.exit(1)
     else: info(f"Manual wireless ADB port {port}")
-    ensure_adb()
-    if not connect_and_forward(port,cdp_port=CDP_PORT,verbose=args.verbose):
-        err("ADB forward failed — troubleshooting:")
-        err("  adb devices; adb forward --list; curl -v http://127.0.0.1:9222/json; rish -c 'id'  (if Shizuku)")
-        sys.exit(1)
+
+    # Try adb forward if we have a wireless port, otherwise we already have direct forward
+    use_direct = (port is None)
+    if not use_direct:
+        ensure_adb()
+        if not connect_and_forward(port,cdp_port=CDP_PORT,verbose=args.verbose):
+            if (use_shizuku or detect_privilege()=="shizuku") and start_shizuku_direct_forward(cdp_port=CDP_PORT, verbose=args.verbose):
+                warn("adb forward failed — but direct Shizuku forward succeeded, continuing")
+                use_direct = True
+            else:
+                err("ADB forward failed — troubleshooting:")
+                err("  adb devices; adb forward --list; curl -v http://127.0.0.1:9222/json; rish -c 'id'  (if Shizuku)")
+                err("  Also try: rish -c 'curl -v http://127.0.0.1:9222/json'  after starting Chrome")
+                sys.exit(1)
+    else:
+        # Verify direct forward is actually listening (retry if needed)
+        time.sleep(0.5)
+        rc, out = run(f"curl -s --connect-timeout 2 http://127.0.0.1:{CDP_PORT}/json/version 2>&1 | head -3", shell=True, timeout=5)
+        if "Browser" not in out:
+            warn(f"Direct forward on :{CDP_PORT} not yet responding (Chrome foreground?). Will still start proxy — open Chrome and retry")
+            # Also try to ensure Chrome is running
+            info("Hint: keep Chrome in foreground with a tab open, then refresh Web UI")
     keep=args.keep_adb
+    # capture use_direct for cleanup closure
+    _use_direct = locals().get("use_direct", False)
     def _sig(*_):
         print()
         if not keep:
             warn("Removing adb forward…")
             run(f"adb forward --remove tcp:{CDP_PORT}",shell=True)
+            if _use_direct:
+                info("Stopping direct forward…")
+                privileged_exec(f"pkill -f devdroid_forward.py 2>/dev/null; pkill -f 'socat.*:{CDP_PORT}' 2>/dev/null; true", "shizuku")
+                run(f"pkill -f devdroid_forward.py 2>/dev/null; pkill -f 'socat.*:{CDP_PORT}' 2>/dev/null; true", shell=True)
         sys.exit(0)
     for sig in (signal.SIGINT,signal.SIGTERM):
         try: signal.signal(sig,_sig)
@@ -961,6 +1151,11 @@ async def main_async(args):
         if not keep:
             try: run(f"adb forward --remove tcp:{CDP_PORT}",shell=True,timeout=5)
             except Exception: pass
+            if locals().get("use_direct") or locals().get("_use_direct"):
+                try:
+                    privileged_exec(f"pkill -f devdroid_forward.py 2>/dev/null; pkill -f 'socat.*:{CDP_PORT}' 2>/dev/null; true", "shizuku")
+                    run(f"pkill -f devdroid_forward.py 2>/dev/null; true", shell=True)
+                except Exception: pass
 
 def main():
     args=parse_args()
