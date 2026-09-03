@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import sys
 
-VERSION = "2.2.5"
+VERSION = "2.2.6"
 # Ultra-fast path for --version / --help (avoid heavy imports on Termux where even asyncio is ~2s)
 if "--version" in sys.argv or "-V" in sys.argv:
     # only fast if version is the main arg; otherwise let argparse handle
@@ -421,10 +421,11 @@ def start_shizuku_direct_forward(cdp_port: int = CDP_PORT, verbose: bool = False
             # If not LISTEN, try next abstract
 
     # Fallback: pure-python forwarder — try Termux direct first (Termux may have adb group on some ROMs)
-    # Test if Termux can directly connect to abstract (no rish needed) — if yes, we don't need rish's shell
-    rc, out = run("python3 -c \"import socket; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(1); s.connect(chr(0)+'chrome_devtools_remote'); print('TERMUX_CAN_CONNECT')\" 2>&1 | head -5", shell=True, timeout=5)
+    # Test if Termux can directly connect to abstract — use a temp script to avoid shell quoting issues with \0
+    test_script = "/data/local/tmp/devdroid_test_abstract.py"
+    rc, out = run(f"cat > {test_script} << 'PYEOF'\nimport socket\ntry:\n    s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(1)\n    s.connect(chr(0)+'chrome_devtools_remote')\n    print('TERMUX_CAN_CONNECT')\nexcept Exception as e:\n    print(f'FAIL {{e}}')\nPYEOF\npython3 {test_script} 2>&1 | head -5; rm -f {test_script}", shell=True, timeout=5)
     termux_can_direct = "TERMUX_CAN_CONNECT" in out
-    info(f"  Termux direct abstract test: {out[:120]!r} -> can_direct={termux_can_direct}")
+    info(f"  Termux direct abstract test: {out[:150]!r} -> can_direct={termux_can_direct}")
     if termux_can_direct:
         info("  Trying Python forwarder via Termux directly (no rish needed)…")
         # Write script already done, now launch via Termux
@@ -445,48 +446,51 @@ def start_shizuku_direct_forward(cdp_port: int = CDP_PORT, verbose: bool = False
 
     info("  Termux direct failed or no permission — trying Python forwarder via rish (shell)…")
     python_forward_code = f'''
-import socket, threading, os, sys
+import socket, threading, os, sys, time
 CDP_PORT={cdp_port}
 ABSTRACTS={ABSTRACTS!r}
-def forward(client, abstract):
-    try:
-        # Connect to Chrome abstract
-        s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s2.connect("\\0" + abstract)
-        def pipe(a,b):
-            try:
-                while True:
-                    d=a.recv(8192)
-                    if not d: break
-                    b.sendall(d)
-            except: pass
-            finally:
-                try: a.close()
-                except: pass
-                try: b.close()
-                except: pass
-        threading.Thread(target=pipe, args=(client, s2), daemon=True).start()
-        pipe(s2, client)
-    except Exception as e:
-        try: client.close()
-        except: pass
-
-def main():
-    # Try each abstract, use first that exists (check via socket connect test)
-    chosen=None
+def forward(client):
+    # Try each abstract until one succeeds — Chrome may use any of them, and may not exist at startup
+    s2 = None
+    last_err = None
     for ab in ABSTRACTS:
         try:
-            s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(1)
-            s.connect("\\0"+ab)
-            s.close()
-            chosen=ab
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect("\\0" + ab)
+            s2 = s
+            # print(f"[forward] connected to {{ab}}", flush=True)
             break
+        except Exception as e:
+            last_err = e
+            try: s.close()
+            except: pass
+            continue
+    if not s2:
+        # No abstract found — Chrome not running or not debuggable
+        try:
+            client.sendall(b"HTTP/1.1 502 Bad Gateway\\r\\nContent-Type: text/plain\\r\\n\\r\\nNo devtools socket found. Is Chrome running with a tab? Tried: " + ",".join(ABSTRACTS).encode())
         except: pass
-    if not chosen:
-        # Fallback to first
-        chosen=ABSTRACTS[0]
-    print(f"[forward] chosen abstract={{chosen}}", flush=True)
+        try: client.close()
+        except: pass
+        return
+    def pipe(a,b):
+        try:
+            while True:
+                d=a.recv(8192)
+                if not d: break
+                b.sendall(d)
+        except: pass
+        finally:
+            try: a.close()
+            except: pass
+            try: b.close()
+            except: pass
+    threading.Thread(target=pipe, args=(client, s2), daemon=True).start()
+    pipe(s2, client)
+
+def main():
+    print(f"[forward] trying abstracts {{ABSTRACTS}}", flush=True)
     srv=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -495,11 +499,11 @@ def main():
         print(f"bind failed {{e}}", flush=True)
         sys.exit(1)
     srv.listen(32)
-    print(f"[forward] listening 127.0.0.1:{{CDP_PORT}} -> {{chosen}} (pid={{os.getpid()}})", flush=True)
+    print(f"[forward] listening 127.0.0.1:{{CDP_PORT}} (pid={{os.getpid()}}) will try {{ABSTRACTS}} per connection", flush=True)
     while True:
         try:
             c,a=srv.accept()
-            threading.Thread(target=forward, args=(c, chosen), daemon=True).start()
+            threading.Thread(target=forward, args=(c,), daemon=True).start()
         except Exception as e:
             print(f"accept error {{e}}", flush=True)
             break
