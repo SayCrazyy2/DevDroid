@@ -1,6 +1,6 @@
 [project]
 name = "devdroid"
-version = "2.2.4"
+version = "2.2.5"
 description = "DevDroid — Full Chrome DevTools on Android via ADB/Shizuku (Shizuku + modern UI)"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import sys
 
-VERSION = "2.2.4"
+VERSION = "2.2.5"
 # Ultra-fast path for --version / --help (avoid heavy imports on Termux where even asyncio is ~2s)
 if "--version" in sys.argv or "-V" in sys.argv:
     # only fast if version is the main arg; otherwise let argparse handle
@@ -690,6 +690,12 @@ def build_frontend_url(tab: dict | str, version_info: dict | None = None) -> str
 
 async def cors_middleware(request, handler):
     _ensure_deps()
+    # Ensure decorator version is set (aiohttp 3.14 requires __middleware_version__ == 1)
+    # If not set, aiohttp treats this as factory (app, handler) instead of (request, handler)
+    if not hasattr(cors_middleware, "__middleware_version__"):
+        try:
+            cors_middleware.__middleware_version__ = 1  # type: ignore
+        except: pass
     if request.method == "OPTIONS":
         resp = web.Response(status=204)
     else:
@@ -1032,6 +1038,10 @@ async def terminal_loop(no_browser,verbose):
 
 def create_app():
     _ensure_deps()
+    # Fix for aiohttp 3.14: middleware must have __middleware_version__ == 1, else aiohttp treats it as factory (app, handler)
+    try:
+        cors_middleware.__middleware_version__ = 1  # type: ignore
+    except: pass
     app=web.Application(middlewares=[cors_middleware])
     app.router.add_get("/",ui_handler)
     app.router.add_get("/health",health_handler)
