@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import sys
 
-VERSION = "2.2.2"
+VERSION = "2.2.3"
 # Ultra-fast path for --version / --help (avoid heavy imports on Termux where even asyncio is ~2s)
 if "--version" in sys.argv or "-V" in sys.argv:
     # only fast if version is the main arg; otherwise let argparse handle
@@ -498,14 +498,41 @@ if __name__=="__main__":
     privileged_exec(f"pkill -f devdroid_forward.py 2>/dev/null; true; rm -f {DIRECT_FORWARD_LOG}", "shizuku")
     run(f"pkill -f devdroid_forward.py 2>/dev/null; true", shell=True, timeout=3)
     time.sleep(0.5)
-    # Launch via rish nohup
-    launch = f"nohup python3 {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!"
-    rc, out = privileged_exec(launch, "shizuku")
-    info(f"  python forward launch -> rc={rc} pid={out[:80]}")
+    # Launch via rish — use Termux python full path (rish's PATH lacks $PREFIX)
+    termux_python = which("python3") or "/data/data/com.termux/files/usr/bin/python3"
+    # Also check alternative names
+    if not Path(termux_python).exists():
+        for cand in ["/data/data/com.termux/files/usr/bin/python", "/data/data/com.termux/files/usr/bin/python3.12", "/data/data/com.termux/files/usr/bin/python3.11"]:
+            if Path(cand).exists():
+                termux_python = cand
+                break
+    # Try rish with full path, plus fallback to Termux directly
+    # Also try nohup via toybox or Termux nohup
+    nohup_bin = "/system/bin/nohup"
+    if Path("/data/data/com.termux/files/usr/bin/nohup").exists():
+        nohup_bin = "/data/data/com.termux/files/usr/bin/nohup"
+    launch_cmds = [
+        f"{nohup_bin} {termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!",
+        f"nohup {termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!",
+        f"{termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!",
+    ]
+    rc, out = 1, ""
+    for lc in launch_cmds:
+        rc, out = privileged_exec(lc, "shizuku")
+        info(f"  python forward via rish ({lc[:60]}…) -> rc={rc} pid={out[:80]!r}")
+        if rc == 0 and out.strip().isdigit():
+            break
+        # Also try without nohup but with sh -c
+        if "No such file" in out and "python" in out:
+            continue
     # Also try via Termux python if rish python not available
     if rc != 0 or not out.strip().isdigit():
-        rc, out = run(f"nohup python3 {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!", shell=True, timeout=5)
-        info(f"  python forward via Termux -> rc={rc} pid={out[:80]}")
+        rc, out = run(f"nohup {termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!", shell=True, timeout=5)
+        info(f"  python forward via Termux ({termux_python}) -> rc={rc} pid={out[:80]!r}")
+        if rc != 0 or not out.strip().isdigit():
+            # Last resort: try python without nohup
+            rc, out = run(f"{termux_python} {DIRECT_FORWARD_SCRIPT} >{DIRECT_FORWARD_LOG} 2>&1 & echo $!", shell=True, timeout=5)
+            info(f"  python forward via Termux (no nohup) -> rc={rc} pid={out[:80]!r}")
     time.sleep(1.5)
     # Verify listening
     rc, out = run(f"ss -tln 2>/dev/null | grep -q ':{cdp_port} ' && echo LISTEN || netstat -tln 2>/dev/null | grep -q ':{cdp_port} ' && echo LISTEN || cat {DIRECT_FORWARD_LOG} 2>/dev/null | head -20", shell=True, timeout=4)
